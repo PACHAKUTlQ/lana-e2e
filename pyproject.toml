@@ -1,0 +1,29 @@
+[project]
+name = "lana"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "librosa>=1.0.0",
+    "numpy>=2.5.3",
+    "pydantic>=2.13.5",
+    "pyworld>=0.3.5",
+    "resampy>=0.4.3",
+    "scipy>=1.18.1",
+    "torch>=2.14.0",
+    "tqdm>=4.70.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
+    "ty>=0.0.69",
+]
+
+[project.scripts]
+lana = "lana.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
