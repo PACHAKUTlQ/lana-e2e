@@ -4,6 +4,7 @@ data/
 dataset/
 outputs/
 config*.json
+training*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
