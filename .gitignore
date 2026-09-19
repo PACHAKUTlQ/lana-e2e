@@ -2,6 +2,7 @@
 old/
 data/
 dataset/
+models/
 outputs/
 config*.json
 training*.json
