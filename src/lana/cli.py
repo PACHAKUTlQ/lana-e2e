@@ -10,7 +10,7 @@ from lana.pipeline import Lana
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add configuration and device options shared by all subcommands."""
+    """Add configuration and device options shared by inference subcommands."""
 
     parser.add_argument(
         "--config",
@@ -25,13 +25,29 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the command tree for codec, vocoder, and feature operations."""
+    """Build the command tree for training, codec, vocoder, and feature operations."""
 
     parser = argparse.ArgumentParser(
         prog="lana",
-        description="SingleCodec and DSPGAN inference.",
+        description="Mel codec training, SingleCodec inference, and DSPGAN synthesis.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    train = commands.add_parser(
+        "train",
+        help="Train and export a new FSQ Mel codec.",
+    )
+    train.add_argument(
+        "--config",
+        type=Path,
+        default=Path("training.json"),
+        help="Training configuration file.",
+    )
+    train.add_argument(
+        "--resume",
+        type=Path,
+        help="Resume a trusted Lightning training checkpoint.",
+    )
 
     encode = commands.add_parser(
         "encode", help="Encode audio into content and speaker codes."
@@ -102,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load_config(arguments: argparse.Namespace) -> Config:
-    """Load JSON and revalidate any explicitly supplied command-line overrides."""
+    """Load JSON and revalidate explicitly supplied inference overrides."""
 
     config = Config.from_file(arguments.config)
     values = config.model_dump(mode="python")
@@ -136,7 +152,14 @@ def _load_config(arguments: argparse.Namespace) -> Config:
 
 
 def _execute(arguments: argparse.Namespace) -> None:
-    """Dispatch a parsed command through the same public application API."""
+    """Dispatch commands while keeping training dependencies out of inference."""
+
+    if arguments.command == "train":
+        from lana.training import train
+
+        train(arguments.config, resume=arguments.resume)
+
+        return
 
     application = Lana(_load_config(arguments))
 
@@ -192,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         _execute(arguments)
-    except (OSError, ValueError, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError, FloatingPointError) as error:
         print(f"lana: {_format_error(error)}", file=sys.stderr)
 
         return 1
