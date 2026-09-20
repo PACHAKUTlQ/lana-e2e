@@ -25,7 +25,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the command tree for training, codec, vocoder, and feature operations."""
+    """Build commands for training, comparison, and inference operations."""
 
     parser = argparse.ArgumentParser(
         prog="lana",
@@ -47,6 +47,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         type=Path,
         help="Resume a trusted Lightning training checkpoint.",
+    )
+
+    comparison = commands.add_parser(
+        "compare-mel",
+        help="Plot aligned Mel-power spectrograms of two audio files.",
+    )
+    comparison.add_argument("original", type=Path)
+    comparison.add_argument("generated", type=Path)
+    comparison.add_argument("output", type=Path)
+    comparison.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.json"),
+        help="Configuration supplying the audio frontend.",
+    )
+    comparison.add_argument(
+        "--max-shift-seconds",
+        type=float,
+        default=2.0,
+        help="Maximum alignment offset in seconds.",
     )
 
     encode = commands.add_parser(
@@ -152,12 +172,26 @@ def _load_config(arguments: argparse.Namespace) -> Config:
 
 
 def _execute(arguments: argparse.Namespace) -> None:
-    """Dispatch commands while keeping training dependencies out of inference."""
+    """Dispatch commands without loading training or plotting code unnecessarily."""
 
     if arguments.command == "train":
         from lana.training import train
 
         train(arguments.config, resume=arguments.resume)
+
+        return
+
+    if arguments.command == "compare-mel":
+        from lana.mel_comparison import plot_mel_comparison
+
+        destination = plot_mel_comparison(
+            arguments.original,
+            arguments.generated,
+            arguments.output,
+            config_path=arguments.config,
+            max_shift_seconds=arguments.max_shift_seconds,
+        )
+        print(destination)
 
         return
 
