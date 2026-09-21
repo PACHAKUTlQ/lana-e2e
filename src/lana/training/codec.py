@@ -5,7 +5,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from lana.training_config import CodecArchitecture
+from lana.training.config import CodecArchitecture
 
 
 class FiniteScalarQuantizer(nn.Module):

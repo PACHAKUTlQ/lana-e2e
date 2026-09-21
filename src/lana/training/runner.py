@@ -15,9 +15,9 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from lana.config import AudioConfig, Config
-from lana.training_codec import TrainableCodec
-from lana.training_config import TrainingConfig
-from lana.training_data import MelDataModule, TrainingBatch
+from lana.training.codec import TrainableCodec
+from lana.training.config import TrainingConfig
+from lana.training.data import MelDataModule, TrainingBatch
 
 
 def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:

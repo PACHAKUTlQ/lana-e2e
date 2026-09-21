@@ -7,11 +7,11 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from lana.acoustics.extraction import discover_audio, extract_batch
+from lana.acoustics.features import extract_file, linear_to_mel
 from lana.artifacts import Audio, FeatureArray, FloatArray, Tokens
 from lana.config import Config, Feature
-from lana.extraction import discover_audio, extract_batch
-from lana.features import extract_file, linear_to_mel
-from lana.models import Models, canonical_mel
+from lana.runtime.models import Models, canonical_mel
 
 
 class Lana:

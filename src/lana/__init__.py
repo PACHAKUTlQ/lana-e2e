@@ -9,7 +9,7 @@ from lana.config import (
     Normalization,
     VocoderConfig,
 )
-from lana.pipeline import Lana
+from lana.runtime.pipeline import Lana
 
 __all__ = [
     "Audio",

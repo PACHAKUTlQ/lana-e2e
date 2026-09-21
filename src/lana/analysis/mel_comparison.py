@@ -8,8 +8,8 @@ from matplotlib.figure import Figure
 from numpy.typing import NDArray
 from scipy import signal
 
+from lana.acoustics.features import process_wav
 from lana.config import AudioConfig, Config
-from lana.features import process_wav
 
 matplotlib.use("Agg")
 

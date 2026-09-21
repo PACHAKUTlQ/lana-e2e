@@ -6,9 +6,9 @@ from pathlib import Path
 
 from tqdm.auto import tqdm
 
+from lana.acoustics.features import extract_file
 from lana.artifacts import save_array
 from lana.config import AudioConfig, Feature
-from lana.features import extract_file
 
 _FEATURE_DIRECTORIES: dict[Feature, str] = {
     Feature.MEL: "mels",

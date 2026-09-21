@@ -1,5 +1,3 @@
-"""In-process latency and token-rate measurements for the Lana pipeline."""
-
 import argparse
 import io
 import statistics
@@ -14,7 +12,7 @@ import torch
 
 from lana.artifacts import Tokens
 from lana.config import Config, Feature
-from lana.pipeline import Lana
+from lana.runtime.pipeline import Lana
 
 T = TypeVar("T")
 

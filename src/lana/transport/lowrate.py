@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from lana.artifacts import Tokens
-from lana.pipeline import Lana
+from lana.runtime.pipeline import Lana
 
 _MAGIC = b"LANA"
 _VERSION = 1

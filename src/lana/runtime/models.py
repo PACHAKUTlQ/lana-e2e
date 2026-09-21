@@ -7,9 +7,9 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from lana.acoustics.features import interpolate_pitch
 from lana.artifacts import Audio
 from lana.config import Config, ModelPaths, VocoderConfig
-from lana.features import interpolate_pitch
 
 
 class CodecModel(Protocol):

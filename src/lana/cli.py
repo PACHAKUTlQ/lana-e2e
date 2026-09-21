@@ -6,7 +6,7 @@ import numpy as np
 
 from lana.artifacts import Tokens, load_array, save_array
 from lana.config import Config, Feature
-from lana.pipeline import Lana
+from lana.runtime.pipeline import Lana
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -175,14 +175,14 @@ def _execute(arguments: argparse.Namespace) -> None:
     """Dispatch commands without loading training or plotting code unnecessarily."""
 
     if arguments.command == "train":
-        from lana.training import train
+        from lana.training.runner import train
 
         train(arguments.config, resume=arguments.resume)
 
         return
 
     if arguments.command == "compare-mel":
-        from lana.mel_comparison import plot_mel_comparison
+        from lana.analysis.mel_comparison import plot_mel_comparison
 
         destination = plot_mel_comparison(
             arguments.original,

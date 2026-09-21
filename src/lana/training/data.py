@@ -11,10 +11,10 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
+from lana.acoustics.features import extract_file
 from lana.artifacts import FeatureArray, load_array, save_array
 from lana.config import AudioConfig, Feature
-from lana.features import extract_file
-from lana.training_config import TrainingConfig, TrainingDataConfig
+from lana.training.config import TrainingConfig, TrainingDataConfig
 
 type TrainingBatch = dict[str, Tensor]
 
