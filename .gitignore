@@ -5,6 +5,7 @@ dataset/
 models/
 outputs/
 *.json
+*.wav
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
