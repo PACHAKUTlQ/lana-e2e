@@ -7,6 +7,7 @@ from lana.config import (
     InferenceConfig,
     ModelPaths,
     Normalization,
+    StreamingConfig,
     VocoderConfig,
 )
 from lana.runtime.pipeline import Lana
@@ -21,6 +22,7 @@ __all__ = [
     "Lana",
     "ModelPaths",
     "Normalization",
+    "StreamingConfig",
     "Tokens",
     "VocoderConfig",
 ]

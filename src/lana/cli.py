@@ -134,6 +134,33 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("input", type=Path)
     convert.add_argument("output", type=Path)
 
+    stream_send = commands.add_parser(
+        "stream-send",
+        help="Send an audio file as a paced stream of encoded chunks.",
+    )
+    stream_send.add_argument("input", type=Path)
+    stream_send.add_argument("--config", type=Path, default=Path("config.json"))
+    stream_send.add_argument("--host", default="127.0.0.1")
+    stream_send.add_argument("--port", type=int, default=8765)
+    stream_send.add_argument(
+        "--no-realtime",
+        action="store_true",
+        help="Send as fast as encoding and network backpressure permit.",
+    )
+
+    stream_receive = commands.add_parser(
+        "stream-receive",
+        help="Receive one encoded stream and progressively write a WAV.",
+    )
+    stream_receive.add_argument("output", type=Path)
+    stream_receive.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.json"),
+    )
+    stream_receive.add_argument("--host", default="127.0.0.1")
+    stream_receive.add_argument("--port", type=int, default=8765)
+
     return parser
 
 
@@ -192,6 +219,29 @@ def _execute(arguments: argparse.Namespace) -> None:
             max_shift_seconds=arguments.max_shift_seconds,
         )
         print(destination)
+
+        return
+
+    if arguments.command in {"stream-send", "stream-receive"}:
+        from lana.streaming.network import receive_file, send_file
+
+        config = Config.from_file(arguments.config)
+
+        if arguments.command == "stream-send":
+            send_file(
+                arguments.input,
+                host=arguments.host,
+                port=arguments.port,
+                config=config,
+                realtime=not arguments.no_realtime,
+            )
+        else:
+            receive_file(
+                arguments.output,
+                host=arguments.host,
+                port=arguments.port,
+                config=config,
+            )
 
         return
 

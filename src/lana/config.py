@@ -181,6 +181,31 @@ class VocoderConfig(FrozenConfig):
         return self
 
 
+class StreamingConfig(FrozenConfig):
+    """Chunk and prompt settings for continuous audio transmission.
+
+    The encoder waits for half an FFT window of future samples before emitting
+    a Mel frame. A final short chunk is padded for model inference, while its
+    transmitted duration remains the number of real Mel frames.
+    """
+
+    chunk_frames: int = Field(default=80, gt=0, le=65535)
+    prompt_frames: int = Field(default=600, gt=0)
+    minimum_model_frames: int = Field(default=10, gt=0)
+    new_embedding_weight: float = Field(default=0.2, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_chunking(self) -> Self:
+        """Keep the minimum model input within a normal transmitted chunk."""
+
+        if self.minimum_model_frames > self.chunk_frames:
+            raise ValueError(
+                "streaming.minimum_model_frames must not exceed chunk_frames."
+            )
+
+        return self
+
+
 class Config(FrozenConfig):
     """Complete application configuration with independently loadable models."""
 
@@ -190,6 +215,7 @@ class Config(FrozenConfig):
     encoding: EncodingConfig = Field(default_factory=EncodingConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     vocoder: VocoderConfig = Field(default_factory=VocoderConfig)
+    streaming: StreamingConfig = Field(default_factory=StreamingConfig)
 
     @classmethod
     def from_file(cls, path: str | Path = "config.json") -> Self:
