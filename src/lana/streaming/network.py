@@ -1,6 +1,7 @@
 import hashlib
 import json
 import socket
+import struct
 import subprocess
 import time
 import wave
@@ -13,6 +14,7 @@ from numpy.typing import NDArray
 
 from lana.config import Config
 from lana.runtime.models import Models
+from lana.streaming.metrics import SendMetrics
 from lana.streaming.session import EncodedChunk, StreamDecoder, StreamEncoder
 from lana.streaming.wire import (
     ACCEPT,
@@ -28,7 +30,8 @@ from lana.streaming.wire import (
     unpack_chunk,
 )
 
-_READ_SAMPLES = 4096
+_READ_SAMPLES = 800
+_MESSAGE_HEADER_BYTES = struct.calcsize(">BI")
 
 
 def _sha256_file(path: Path) -> str:
@@ -64,8 +67,15 @@ def _setup(config: Config) -> StreamSetup:
     )
 
 
-def _pcm_from_ffmpeg(path: Path, sample_rate: int) -> Iterator[NDArray[np.int16]]:
-    """Decode an input file incrementally to mono PCM16 at the frontend rate."""
+def _pcm_from_ffmpeg(
+    path: Path,
+    sample_rate: int,
+) -> Iterator[NDArray[np.int16]]:
+    """Decode an input file incrementally to mono PCM16 at the frontend rate.
+
+    Diagnostics use a temporary file instead of a second pipe. This prevents
+    FFmpeg from blocking when it writes enough diagnostic output to fill a pipe.
+    """
 
     command = [
         "ffmpeg",
@@ -124,11 +134,56 @@ def _pcm_from_ffmpeg(path: Path, sample_rate: int) -> Iterator[NDArray[np.int16]
 def _send_chunks(
     connection: ByteConnection,
     chunks: list[EncodedChunk],
+    metrics: SendMetrics,
 ) -> None:
-    """Send newly encoded chunks in their original sequence order."""
+    """Serialize and submit chunks while measuring actual message sizes."""
 
     for chunk in chunks:
-        send_message(connection, CHUNK, pack_chunk(chunk))
+        build_started = time.perf_counter()
+        payload = pack_chunk(chunk)
+        build_seconds = time.perf_counter() - build_started
+
+        send_started = time.perf_counter()
+        send_message(connection, CHUNK, payload)
+        sent_at = time.perf_counter()
+
+        metrics.record_chunk(
+            chunk,
+            len(payload),
+            build_seconds=build_seconds,
+            send_seconds=sent_at - send_started,
+            sent_at=sent_at,
+        )
+
+
+def _load_sender_codec(models: Models) -> float:
+    """Load the sender's codec before starting the paced audio clock."""
+
+    started = time.perf_counter()
+    _ = models.codec
+
+    return time.perf_counter() - started
+
+
+def _load_receiver_models(models: Models) -> dict[str, float]:
+    """Measure all receiver model and transform loads before accepting audio."""
+
+    vocoder = models.vocoder
+    operations = (
+        ("codec", lambda: models.codec),
+        ("pitch model", lambda: vocoder.pitch_model),
+        ("prior generator", lambda: vocoder.prior_generator),
+        ("waveform generator", lambda: vocoder.generator),
+        ("prior Mel transform", lambda: vocoder.mel_transform),
+    )
+    timings: dict[str, float] = {}
+
+    for name, operation in operations:
+        started = time.perf_counter()
+        operation()
+        timings[name] = time.perf_counter() - started
+
+    return timings
 
 
 def send_file(
@@ -139,44 +194,90 @@ def send_file(
     config: Config,
     realtime: bool = True,
 ) -> None:
-    """Encode an audio file and send chunks over an ordered byte connection.
+    """Stream a file and measure encoder timing and exact serialized bytes.
 
-    The receiver accepts the model and signal settings before file decoding
-    starts. With realtime pacing, input consumption follows recording time;
-    TCP backpressure can make it slower if processing cannot keep up.
+    PCM is paced against a monotonic clock before entering the encoder. Codec
+    loading and setup negotiation are excluded from that clock and reported
+    separately. The final acknowledgement confirms receiver completion.
     """
 
     source = Path(input_path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Input audio not found: {source}")
 
+    setup_started = time.perf_counter()
     setup = _setup(config)
-    encoder = StreamEncoder(config, Models(config))
+    setup_seconds = time.perf_counter() - setup_started
+
+    models = Models(config)
+    codec_load_seconds = _load_sender_codec(models)
+    encoder = StreamEncoder(config, models)
 
     with socket.create_connection((host, port)) as connection:
-        send_message(connection, SETUP, setup.to_bytes())
-        kind, payload = receive_message(connection)
+        setup_payload = setup.to_bytes()
+        send_message(connection, SETUP, setup_payload)
 
+        kind, payload = receive_message(connection)
         if kind == REJECT:
             raise RuntimeError(payload.decode("utf-8", errors="replace"))
         if kind != ACCEPT or payload:
             raise ValueError("The receiver did not accept the stream.")
 
-        start = time.monotonic()
-        sample_count = 0
+        metrics = SendMetrics(
+            sample_rate=config.audio.sample_rate,
+            hop_size=config.audio.hop_size,
+            started_at=time.perf_counter(),
+            setup_bytes=_MESSAGE_HEADER_BYTES + len(setup_payload),
+            received_control_bytes=_MESSAGE_HEADER_BYTES,
+        )
 
         for samples in _pcm_from_ffmpeg(source, config.audio.sample_rate):
-            _send_chunks(connection, encoder.push(samples))
-            sample_count += samples.size
+            next_sample_count = metrics.input_samples + samples.size
 
             if realtime:
-                deadline = start + sample_count / config.audio.sample_rate
-                remaining = deadline - time.monotonic()
+                deadline = (
+                    metrics.started_at + next_sample_count / config.audio.sample_rate
+                )
+                remaining = deadline - time.perf_counter()
                 if remaining > 0:
                     time.sleep(remaining)
 
-        _send_chunks(connection, encoder.finish())
+            metrics.input_samples = next_sample_count
+
+            encode_started = time.perf_counter()
+            chunks = encoder.push(samples)
+            metrics.record_encoder_call(time.perf_counter() - encode_started)
+
+            _send_chunks(connection, chunks, metrics)
+            metrics.observe_send_lag(time.perf_counter())
+
+        if metrics.input_samples == 0:
+            raise ValueError("FFmpeg produced no audio samples.")
+
+        encode_started = time.perf_counter()
+        final_chunks = encoder.finish()
+        metrics.record_encoder_call(time.perf_counter() - encode_started)
+        _send_chunks(connection, final_chunks, metrics)
+
+        if metrics.chunk_count == 0:
+            raise ValueError("The input did not produce a complete Mel frame.")
+
         send_message(connection, END)
+        metrics.end_sent_at = time.perf_counter()
+        metrics.end_bytes = _MESSAGE_HEADER_BYTES
+        metrics.observe_send_lag(metrics.end_sent_at)
+
+        kind, payload = receive_message(connection)
+        if kind != ACCEPT or payload:
+            raise ValueError("The receiver did not confirm stream completion.")
+
+        metrics.received_control_bytes += _MESSAGE_HEADER_BYTES
+        metrics.completed_at = time.perf_counter()
+
+    metrics.report(
+        setup_seconds=setup_seconds,
+        codec_load_seconds=codec_load_seconds,
+    )
 
 
 def _receive_connection(
@@ -218,14 +319,15 @@ def _receive_connection(
             if kind == END:
                 if payload:
                     raise ValueError("The end message must be empty.")
-
-                return
+                break
 
             if kind != CHUNK:
                 raise ValueError(f"Unexpected stream message type: {kind}.")
 
             audio = decoder.push(unpack_chunk(payload))
             output.writeframes(audio.samples.astype("<i2", copy=False).tobytes())
+
+    send_message(connection, ACCEPT)
 
 
 def receive_file(
@@ -235,10 +337,20 @@ def receive_file(
     port: int,
     config: Config,
 ) -> None:
-    """Accept one TCP connection and synthesize its chunks into a WAV file."""
+    """Load receiver models, then accept and decode one TCP stream."""
 
+    setup_started = time.perf_counter()
     local_setup = _setup(config)
+    setup_seconds = time.perf_counter() - setup_started
+
     models = Models(config)
+    load_timings = _load_receiver_models(models)
+
+    print("Receiver startup")
+    print(f"  Setup preparation:    {setup_seconds:.6f} s")
+    for name, seconds in load_timings.items():
+        print(f"  {name}: {seconds:.6f} s")
+    print("  Ready to accept audio.", flush=True)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
