@@ -33,12 +33,12 @@ class StreamEncoder:
     """
 
     def __init__(self, config: Config, models: Models | None = None) -> None:
-        """Create independent per-stream state while sharing optionally loaded models."""
+        """Create per-session frontend, prompt, embedding, and sequence state."""
 
+        config.validate_codec_frontend()
         self.config = config
         self.models = models if models is not None else Models(config)
         self.frontend = StreamingMelFrontend(config.audio)
-
         self._pending = np.empty((config.audio.n_mels, 0), dtype=np.float32)
         self._prompt: Tensor | None = None
         self._embedding: Tensor | None = None
@@ -49,7 +49,7 @@ class StreamEncoder:
         """Consume PCM samples and encode every newly completed normal chunk."""
 
         if self._finished:
-            raise RuntimeError("The stream encoder has already been finished.")
+            raise RuntimeError("The encoder has already been finished.")
 
         return self._consume(self.frontend.push(samples), final=False)
 
@@ -57,8 +57,7 @@ class StreamEncoder:
         """Flush right-context Mel frames and encode the final partial chunk."""
 
         if self._finished:
-            raise RuntimeError("The stream encoder has already been finished.")
-
+            raise RuntimeError("The encoder has already been finished.")
         self._finished = True
 
         return self._consume(self.frontend.finish(), final=True)
@@ -73,20 +72,16 @@ class StreamEncoder:
 
         if mel.shape[1]:
             self._pending = np.concatenate((self._pending, mel), axis=1)
-
         result: list[EncodedChunk] = []
-        chunk_frames = self.config.streaming.chunk_frames
+        frames = self.config.streaming.chunk_frames
 
-        while self._pending.shape[1] >= chunk_frames:
-            result.append(self._encode(self._pending[:, :chunk_frames]))
-            self._pending = self._pending[:, chunk_frames:]
+        while self._pending.shape[1] >= frames:
+            result.append(self._encode(self._pending[:, :frames]))
+            self._pending = self._pending[:, frames:].copy()
 
         if final and self._pending.shape[1]:
             result.append(self._encode(self._pending))
-            self._pending = np.empty(
-                (self.config.audio.n_mels, 0),
-                dtype=np.float32,
-            )
+            self._pending = np.empty((self.config.audio.n_mels, 0), dtype=np.float32)
 
         return result
 
@@ -96,51 +91,46 @@ class StreamEncoder:
 
         settings = self.config.streaming
         frames = mel.shape[1]
-        minimum = settings.minimum_model_frames
-
-        if frames < minimum:
+        if frames < settings.chunk_frames:
             mel = np.pad(
                 mel,
-                ((0, 0), (0, minimum - frames)),
+                ((0, 0), (0, settings.chunk_frames - frames)),
                 mode="edge",
             )
 
-        tensor = torch.from_numpy(np.ascontiguousarray(mel))
-        tensor = ((tensor.to(self.models.device) + 1.0) / 2.0).unsqueeze(0)
+        tensor = torch.from_numpy(np.ascontiguousarray(mel)).to(self.models.device)
+        tensor = ((tensor + 1.0) / 2.0).unsqueeze(0)
+        self._prompt = (
+            tensor
+            if self._prompt is None
+            else torch.cat((self._prompt, tensor), dim=-1)
+        )
+        self._prompt = self._prompt[:, :, -settings.prompt_frames :].contiguous()
 
-        if self._prompt is None:
-            self._prompt = tensor
-        else:
-            self._prompt = torch.cat((self._prompt, tensor), dim=-1)
-        self._prompt = self._prompt[:, :, -settings.prompt_frames :]
-
-        current_embedding = self.models.codec.ref_encoder(self._prompt)
+        current = self.models.codec.ref_encoder(self._prompt)
         if self._embedding is None:
-            self._embedding = current_embedding
+            self._embedding = current
         else:
             weight = settings.new_embedding_weight
-            self._embedding = (
-                self._embedding * (1.0 - weight) + current_embedding * weight
-            )
+            self._embedding = self._embedding * (1.0 - weight) + current * weight
 
         _, speaker_codes = self.models.codec.refemb_fsq(self._embedding)
-        _, content_codes, _ = self.models.codec.encode_ref(
-            tensor,
-            self._embedding,
-        )
-
-        content = np.asarray(
-            content_codes.detach().cpu().numpy(),
-            dtype=np.int64,
-        )
+        _, content_codes, _ = self.models.codec.encode_ref(tensor, self._embedding)
+        content = content_codes.detach().cpu().numpy()
         speaker = speaker_codes.detach().cpu().numpy()
 
-        if content.ndim != 2 or content.shape[0] != 1 or content.shape[1] == 0:
-            raise ValueError("The codec returned invalid content-code dimensions.")
-        if speaker.shape != (1, 1):
-            raise ValueError("The codec returned invalid speaker-code dimensions.")
+        if (
+            content.dtype != np.int64
+            or content.ndim != 3
+            or content.shape[0] != 1
+            or content.shape[1] == 0
+            or content.shape[2] != self.config.codec.num_quantizers
+        ):
+            raise ValueError("The codec returned invalid layered content codes.")
+        if speaker.dtype != np.int64 or speaker.shape != (1, 1):
+            raise ValueError("The codec returned invalid speaker codes.")
 
-        packet = EncodedChunk(
+        chunk = EncodedChunk(
             sequence=self._sequence,
             frames=frames,
             content=np.ascontiguousarray(content[0]),
@@ -148,7 +138,7 @@ class StreamEncoder:
         )
         self._sequence += 1
 
-        return packet
+        return chunk
 
 
 class StreamDecoder:
@@ -160,47 +150,60 @@ class StreamDecoder:
         self.config = config
         self.models = models if models is not None else Models(config)
         self._next_sequence = 0
+        self._frames = 0
+        self._samples = 0
+        self._partial_received = False
 
     @torch.inference_mode()
     def push(self, chunk: EncodedChunk) -> Audio:
         """Decode one chunk and retain exactly its declared audio duration."""
 
+        settings = self.config.streaming
+        if self._partial_received:
+            raise ValueError("A partial block must be the final audio block.")
         if chunk.sequence != self._next_sequence:
             raise ValueError(
                 f"Expected chunk {self._next_sequence}, got {chunk.sequence}."
             )
-        if not 1 <= chunk.frames <= self.config.streaming.chunk_frames:
-            raise ValueError("Chunk frame count is outside the configured range.")
-        if chunk.content.ndim != 1 or chunk.content.size == 0:
-            raise ValueError("Chunk contains no content codes.")
+        if not 1 <= chunk.frames <= settings.chunk_frames:
+            raise ValueError("Invalid chunk frame count.")
+        if (
+            chunk.content.dtype != np.int64
+            or chunk.content.ndim != 2
+            or chunk.content.shape[0] == 0
+            or chunk.content.shape[1] != self.config.codec.num_quantizers
+        ):
+            raise ValueError("Invalid layered content dimensions.")
+        if np.any(chunk.content < 0) or chunk.speaker < 0:
+            raise ValueError("Quantizer indices must be nonnegative.")
 
         device = self.models.device
-        content = torch.from_numpy(chunk.content.reshape(1, -1)).to(device)
+        content = torch.from_numpy(np.ascontiguousarray(chunk.content[None])).to(device)
         speaker = torch.tensor([[chunk.speaker]], dtype=torch.int64, device=device)
-
         decoded = self.models.codec.decode(content, speaker)
-        mel = canonical_mel(
-            decoded * 2.0 - 1.0,
-            self.config.audio.n_mels,
-        )
-        if mel.shape[1] < chunk.frames:
-            raise ValueError("The codec decoded fewer frames than the packet declares.")
+        mel = canonical_mel(decoded * 2.0 - 1.0, self.config.audio.n_mels)
 
-        audio = self.models.vocoder.decode(mel[:, : chunk.frames])
-        expected_samples = round(
-            chunk.frames
-            * self.config.audio.hop_size
-            * self.config.vocoder.sampling_rate
-            / self.config.audio.sample_rate
-        )
-        if audio.samples.size < expected_samples:
+        if mel.shape[1] != settings.chunk_frames:
             raise ValueError(
-                "The vocoder returned less audio than the packet duration."
+                "Decoded block length differs from the trained block size."
             )
 
-        self._next_sequence += 1
-
-        return Audio(
-            samples=audio.samples[:expected_samples],
-            sample_rate=audio.sample_rate,
+        audio = self.models.vocoder.decode(mel)
+        total_frames = self._frames + chunk.frames
+        sample_rate = self.config.vocoder.sampling_rate
+        total_samples = (
+            total_frames
+            * self.config.audio.hop_size
+            * sample_rate
+            // self.config.audio.sample_rate
         )
+        expected = total_samples - self._samples
+        if audio.samples.size < expected:
+            raise ValueError("Vocoder output is shorter than the declared duration.")
+
+        self._frames = total_frames
+        self._samples = total_samples
+        self._next_sequence += 1
+        self._partial_received = chunk.frames < settings.chunk_frames
+
+        return Audio(audio.samples[:expected], sample_rate)

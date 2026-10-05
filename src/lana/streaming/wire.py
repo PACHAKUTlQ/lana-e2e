@@ -8,11 +8,13 @@ import numpy as np
 from lana.streaming.session import EncodedChunk
 
 MAGIC = "LANA-STREAM"
-VERSION = 1
+VERSION = 2
 MAX_MESSAGE_BYTES = 1 << 20
 
-_KIND_HEADER = struct.Struct(">BI")
-_CHUNK_HEADER = struct.Struct(">IHHBq")
+_MESSAGE_HEADER = struct.Struct(">BI")
+_CHUNK_HEADER = struct.Struct(">IHHBBq")
+MESSAGE_HEADER_BYTES = _MESSAGE_HEADER.size
+CHUNK_HEADER_BYTES = _CHUNK_HEADER.size
 
 SETUP = 1
 CHUNK = 2
@@ -62,12 +64,9 @@ class StreamSetup:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "StreamSetup":
-        """Validate and deserialize a received setup record."""
+        """Validate setup fields before constructing a session identity."""
 
-        value = json.loads(data)
-        if not isinstance(value, dict):
-            raise TypeError("Stream setup must be a JSON object.")
-
+        values = json.loads(data)
         expected = {
             "magic",
             "version",
@@ -76,36 +75,37 @@ class StreamSetup:
             "sample_rate",
             "output_sample_rate",
         }
-        if set(value) != expected:
+        if not isinstance(values, dict) or set(values) != expected:
             raise ValueError("Invalid stream setup fields.")
-        if value["magic"] != MAGIC or type(value["version"]) is not int:
-            raise ValueError("Unsupported stream protocol.")
-        if value["version"] != VERSION:
+        if (
+            values["magic"] != MAGIC
+            or type(values["version"]) is not int
+            or values["version"] != VERSION
+        ):
             raise ValueError("Unsupported stream protocol.")
 
-        for key in ("model_sha256", "config_sha256"):
-            digest = value[key]
+        for name in ("model_sha256", "config_sha256"):
+            digest = values[name]
             if (
                 not isinstance(digest, str)
                 or len(digest) != 64
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
-                raise ValueError(f"Invalid {key}.")
-
-        for key in ("sample_rate", "output_sample_rate"):
-            if type(value[key]) is not int or value[key] <= 0:
-                raise ValueError(f"Invalid {key}.")
+                raise ValueError(f"Invalid {name}.")
+        for name in ("sample_rate", "output_sample_rate"):
+            if type(values[name]) is not int or values[name] <= 0:
+                raise ValueError(f"Invalid {name}.")
 
         return cls(
-            model_sha256=value["model_sha256"],
-            config_sha256=value["config_sha256"],
-            sample_rate=value["sample_rate"],
-            output_sample_rate=value["output_sample_rate"],
+            model_sha256=values["model_sha256"],
+            config_sha256=values["config_sha256"],
+            sample_rate=values["sample_rate"],
+            output_sample_rate=values["output_sample_rate"],
         )
 
 
-def _read_exact(connection: ByteConnection, length: int) -> bytes:
-    """Read exactly length bytes or report an interrupted connection."""
+def read_exact(connection: ByteConnection, length: int) -> bytes:
+    """Read a complete field or report an interrupted stream."""
 
     result = bytearray()
     while len(result) < length:
@@ -124,21 +124,23 @@ def send_message(
 ) -> None:
     """Send one length-prefixed protocol message."""
 
+    if kind not in {SETUP, CHUNK, END, ACCEPT, REJECT}:
+        raise ValueError("Unknown stream message type.")
     if len(payload) > MAX_MESSAGE_BYTES:
-        raise ValueError("Stream message exceeds the size limit.")
-
-    connection.sendall(_KIND_HEADER.pack(kind, len(payload)) + payload)
+        raise ValueError("Stream message exceeds its size limit.")
+    connection.sendall(_MESSAGE_HEADER.pack(kind, len(payload)) + payload)
 
 
 def receive_message(connection: ByteConnection) -> tuple[int, bytes]:
     """Receive one complete length-prefixed protocol message."""
 
-    header = _read_exact(connection, _KIND_HEADER.size)
-    kind, length = _KIND_HEADER.unpack(header)
+    kind, length = _MESSAGE_HEADER.unpack(read_exact(connection, MESSAGE_HEADER_BYTES))
+    if kind not in {SETUP, CHUNK, END, ACCEPT, REJECT}:
+        raise ValueError("Unknown stream message type.")
     if length > MAX_MESSAGE_BYTES:
-        raise ValueError("Stream message exceeds the size limit.")
+        raise ValueError("Stream message exceeds its size limit.")
 
-    return kind, _read_exact(connection, length)
+    return kind, read_exact(connection, length)
 
 
 def pack_chunk(chunk: EncodedChunk) -> bytes:
@@ -147,41 +149,43 @@ def pack_chunk(chunk: EncodedChunk) -> bytes:
     content = chunk.content
     if (
         content.dtype != np.int64
-        or content.ndim != 1
-        or not 1 <= content.size <= 65535
+        or content.ndim != 2
+        or not 1 <= content.shape[0] <= 65535
+        or not 1 <= content.shape[1] <= 16
         or np.any(content < 0)
     ):
-        raise ValueError("Expected 1–65535 nonnegative int64 content indices.")
+        raise ValueError("Invalid layered int64 content codes.")
     if not 0 <= chunk.sequence <= 0xFFFFFFFF:
-        raise ValueError("Chunk sequence exceeds the protocol range.")
+        raise ValueError("Sequence exceeds the protocol range.")
     if not 1 <= chunk.frames <= 65535:
-        raise ValueError("Chunk frame count exceeds the protocol range.")
+        raise ValueError("Frame count exceeds the protocol range.")
+    if not 0 <= chunk.speaker <= 0x7FFFFFFFFFFFFFFF:
+        raise ValueError("Speaker index exceeds the protocol range.")
 
-    width = max(1, int(np.max(content)).bit_length())
-    if width > 63:
-        raise ValueError("Content index exceeds the supported range.")
+    width = max(1, int(content.max()).bit_length())
+    payload_bytes = (content.size * width + 7) // 8
+    if CHUNK_HEADER_BYTES + payload_bytes > MAX_MESSAGE_BYTES:
+        raise ValueError("Encoded chunk exceeds its size limit.")
 
     payload = bytearray()
     buffer = 0
-    buffered_bits = 0
-
-    for index in content:
-        buffer = (buffer << width) | int(index)
-        buffered_bits += width
-
-        while buffered_bits >= 8:
-            buffered_bits -= 8
-            payload.append((buffer >> buffered_bits) & 0xFF)
-            buffer &= (1 << buffered_bits) - 1
-
-    if buffered_bits:
-        payload.append(buffer << (8 - buffered_bits))
+    bits = 0
+    for value in content.flat:
+        buffer = (buffer << width) | int(value)
+        bits += width
+        while bits >= 8:
+            bits -= 8
+            payload.append((buffer >> bits) & 0xFF)
+            buffer &= (1 << bits) - 1
+    if bits:
+        payload.append(buffer << (8 - bits))
 
     return (
         _CHUNK_HEADER.pack(
             chunk.sequence,
             chunk.frames,
-            content.size,
+            content.shape[0],
+            content.shape[1],
             width,
             chunk.speaker,
         )
@@ -192,32 +196,38 @@ def pack_chunk(chunk: EncodedChunk) -> bytes:
 def unpack_chunk(data: bytes) -> EncodedChunk:
     """Restore a chunk and reject invalid lengths or nonzero padding bits."""
 
-    if len(data) < _CHUNK_HEADER.size:
-        raise ValueError("Truncated encoded chunk.")
-
-    sequence, frames, count, width, speaker = _CHUNK_HEADER.unpack_from(data)
-    if frames == 0 or count == 0 or not 1 <= width <= 63:
+    if not CHUNK_HEADER_BYTES <= len(data) <= MAX_MESSAGE_BYTES:
+        raise ValueError("Invalid encoded chunk size.")
+    sequence, frames, positions, layers, width, speaker = _CHUNK_HEADER.unpack_from(
+        data
+    )
+    if (
+        frames == 0
+        or positions == 0
+        or not 1 <= layers <= 16
+        or not 1 <= width <= 63
+        or speaker < 0
+    ):
         raise ValueError("Invalid encoded chunk header.")
 
-    payload = data[_CHUNK_HEADER.size :]
+    count = positions * layers
+    payload = data[CHUNK_HEADER_BYTES:]
     if len(payload) != (count * width + 7) // 8:
-        raise ValueError("Invalid encoded chunk payload length.")
+        raise ValueError("Encoded payload length differs from its dimensions.")
 
     content = np.empty(count, dtype=np.int64)
     buffer = 0
-    buffered_bits = 0
+    bits = 0
     position = 0
     mask = (1 << width) - 1
-
     for byte in payload:
         buffer = (buffer << 8) | byte
-        buffered_bits += 8
-
-        while buffered_bits >= width and position < count:
-            buffered_bits -= width
-            content[position] = (buffer >> buffered_bits) & mask
+        bits += 8
+        while bits >= width and position < count:
+            bits -= width
+            content[position] = (buffer >> bits) & mask
             position += 1
-            buffer &= (1 << buffered_bits) - 1
+            buffer &= (1 << bits) - 1
 
     if position != count or buffer != 0:
         raise ValueError("Invalid encoded chunk padding.")
@@ -225,6 +235,6 @@ def unpack_chunk(data: bytes) -> EncodedChunk:
     return EncodedChunk(
         sequence=sequence,
         frames=frames,
-        content=content,
+        content=content.reshape(positions, layers),
         speaker=speaker,
     )

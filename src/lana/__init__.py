@@ -1,6 +1,8 @@
 from lana.artifacts import Audio, Tokens
 from lana.config import (
     AudioConfig,
+    CodecArchitecture,
+    CodecConfig,
     Config,
     EncodingConfig,
     Feature,
@@ -8,6 +10,7 @@ from lana.config import (
     ModelPaths,
     Normalization,
     StreamingConfig,
+    TrainingConfig,
     VocoderConfig,
 )
 from lana.runtime.pipeline import Lana
@@ -15,6 +18,8 @@ from lana.runtime.pipeline import Lana
 __all__ = [
     "Audio",
     "AudioConfig",
+    "CodecArchitecture",
+    "CodecConfig",
     "Config",
     "EncodingConfig",
     "Feature",
@@ -24,5 +29,6 @@ __all__ = [
     "Normalization",
     "StreamingConfig",
     "Tokens",
+    "TrainingConfig",
     "VocoderConfig",
 ]

@@ -1,19 +1,12 @@
-import struct
 from dataclasses import dataclass
 
 from lana.streaming.session import EncodedChunk
-
-_MESSAGE_HEADER_BYTES = struct.calcsize(">BI")
-_CHUNK_HEADER_BYTES = struct.calcsize(">IHHBq")
+from lana.streaming.wire import CHUNK_HEADER_BYTES, MESSAGE_HEADER_BYTES
 
 
 @dataclass(slots=True)
 class SendMetrics:
-    """Measure encoder work, pacing, and exact serialized outbound bytes.
-
-    Timing begins after setup negotiation. Model loading is measured separately.
-    Byte counts increase only after the corresponding send operation succeeds.
-    """
+    """Measure encoding work and successful application-layer transmissions."""
 
     sample_rate: int
     hop_size: int
@@ -62,8 +55,8 @@ class SendMetrics:
 
         self.chunk_count += 1
         self.encoded_frames += chunk.frames
-        self.content_bytes += packed_bytes - _CHUNK_HEADER_BYTES
-        self.chunk_bytes += _MESSAGE_HEADER_BYTES + packed_bytes
+        self.content_bytes += packed_bytes - CHUNK_HEADER_BYTES
+        self.chunk_bytes += MESSAGE_HEADER_BYTES + packed_bytes
         self.packet_build_seconds += build_seconds
         self.send_seconds += send_seconds
 
@@ -73,68 +66,61 @@ class SendMetrics:
     def observe_send_lag(self, now: float) -> None:
         """Compare sender progress with the duration of PCM already consumed."""
 
-        audio_seconds = self.input_samples / self.sample_rate
-        lag = max(0.0, now - self.started_at - audio_seconds)
+        duration = self.input_samples / self.sample_rate
+        lag = max(0.0, now - self.started_at - duration)
         self.maximum_send_lag_seconds = max(self.maximum_send_lag_seconds, lag)
         self.final_send_lag_seconds = lag
 
-    def report(
-        self,
-        *,
-        setup_seconds: float,
-        codec_load_seconds: float,
-    ) -> None:
-        """Print measured durations, byte counts, and exact application bitrates."""
+    def report(self, *, setup_seconds: float, codec_load_seconds: float) -> None:
+        """Report exact application bytes and elapsed sender-side measurements."""
 
         duration = self.input_samples / self.sample_rate
-        if duration <= 0 or self.end_sent_at is None or self.completed_at is None:
-            raise ValueError("A complete nonempty stream is required for reporting.")
+        if (
+            duration <= 0
+            or self.end_sent_at is None
+            or self.completed_at is None
+            or self.first_chunk_seconds is None
+        ):
+            raise ValueError("A complete nonempty stream is required.")
 
-        outbound_bytes = self.setup_bytes + self.chunk_bytes + self.end_bytes
-        sent_seconds = self.end_sent_at - self.started_at
-        completed_seconds = self.completed_at - self.started_at
-
+        outbound = self.setup_bytes + self.chunk_bytes + self.end_bytes
+        timings = {
+            "Setup preparation": setup_seconds,
+            "Codec loading": codec_load_seconds,
+            "Input duration": duration,
+            "Frontend and codec": self.encoder_seconds,
+            "Longest encoder call": self.longest_encoder_call_seconds,
+            "Packet construction": self.packet_build_seconds,
+            "TCP submission": self.send_seconds,
+            "First chunk submitted": self.first_chunk_seconds,
+            "Last byte submitted": self.end_sent_at - self.started_at,
+            "Receiver completion": self.completed_at - self.started_at,
+            "Maximum sender lag": self.maximum_send_lag_seconds,
+            "Final sender lag": self.final_send_lag_seconds,
+        }
         print("\nSender measurements")
-        print(f"  Setup preparation:            {setup_seconds:.6f} s")
-        print(f"  Codec loading:                {codec_load_seconds:.6f} s")
-        print(f"  Input PCM samples:            {self.input_samples}")
-        print(f"  Input PCM duration:           {duration:.6f} s")
-        print(f"  Encoded Mel frames:           {self.encoded_frames}")
-        print(
-            "  Encoded-frame duration:      "
-            f"{self.encoded_frames * self.hop_size / self.sample_rate:.6f} s"
-        )
-        print(f"  Chunks sent:                  {self.chunk_count}")
-        print(f"  Frontend + codec time:        {self.encoder_seconds:.6f} s")
-        print(f"  Encoder time / audio time:    {self.encoder_seconds / duration:.6f}")
-        print(
-            f"  Longest encoder call:        {self.longest_encoder_call_seconds:.6f} s"
-        )
-        print(f"  Packet construction time:    {self.packet_build_seconds:.6f} s")
-        print(f"  TCP sendall time:             {self.send_seconds:.6f} s")
-        print(f"  First chunk submitted at:    {self.first_chunk_seconds:.6f} s")
-        print(f"  Last byte submitted at:      {sent_seconds:.6f} s")
-        print(f"  Receiver finished at:        {completed_seconds:.6f} s")
-        print(f"  Maximum sender lag:          {self.maximum_send_lag_seconds:.6f} s")
-        print(f"  Final sender lag:            {self.final_send_lag_seconds:.6f} s")
+        for name, value in timings.items():
+            print(f"  {name:<26} {value:.6f} s")
+        print(f"  Encoder real-time factor:  {self.encoder_seconds / duration:.6f}")
+        print(f"  Input samples:             {self.input_samples}")
+        print(f"  Encoded Mel frames:        {self.encoded_frames}")
+        print(f"  Chunks:                    {self.chunk_count}")
 
-        print("\nExact application-layer bytes")
-        print(f"  Packed content:              {self.content_bytes}")
-        print(f"  All CHUNK messages:          {self.chunk_bytes}")
-        print(f"  SETUP message:               {self.setup_bytes}")
-        print(f"  END message:                 {self.end_bytes}")
-        print(f"  Total outbound:              {outbound_bytes}")
-        print(f"  Control received from peer: {self.received_control_bytes}")
+        print("\nApplication-layer bytes")
+        for name, value in {
+            "Packed content": self.content_bytes,
+            "CHUNK messages": self.chunk_bytes,
+            "SETUP message": self.setup_bytes,
+            "END message": self.end_bytes,
+            "Complete outbound stream": outbound,
+            "Received control messages": self.received_control_bytes,
+        }.items():
+            print(f"  {name:<26} {value}")
 
-        print("\nBitrates over actual input PCM duration")
-        print(
-            "  Packed content:              "
-            f"{self.content_bytes * 8 / duration:.3f} bit/s"
-        )
-        print(
-            "  All CHUNK messages:          "
-            f"{self.chunk_bytes * 8 / duration:.3f} bit/s"
-        )
-        print(
-            f"  Complete outbound stream:    {outbound_bytes * 8 / duration:.3f} bit/s"
-        )
+        print("\nBitrates over input PCM duration")
+        for name, value in {
+            "Packed content": self.content_bytes,
+            "CHUNK messages": self.chunk_bytes,
+            "Complete outbound stream": outbound,
+        }.items():
+            print(f"  {name:<26} {value * 8 / duration:.3f} bit/s")

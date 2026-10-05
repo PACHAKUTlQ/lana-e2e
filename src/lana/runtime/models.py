@@ -9,33 +9,34 @@ from torch import Tensor
 
 from lana.acoustics.features import interpolate_pitch
 from lana.artifacts import Audio
+from lana.codec.artifact import load_codec
 from lana.config import Config, ModelPaths, VocoderConfig
 
 
 class CodecModel(Protocol):
-    """TorchScript methods used by whole-utterance and chunked codec inference."""
+    """Codec methods shared by offline and streaming application interfaces."""
 
     def encode(
         self,
         mel: Tensor,
         prompt: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Return content and speaker quantizer outputs and code tensors."""
+        """Return quantized content, layered codes, and speaker information."""
 
         ...
 
     def decode(self, codes: Tensor, speaker_codes: Tensor) -> Tensor:
-        """Decode content and speaker codes into a batch of normalized Mels."""
+        """Decode content codes with shape (batch, positions, quantizers)."""
 
         ...
 
     def ref_encoder(self, prompt: Tensor) -> Tensor:
-        """Encode the current prompt history into a speaker embedding."""
+        """Encode a bounded prompt history."""
 
         ...
 
     def refemb_fsq(self, embedding: Tensor) -> tuple[Tensor, Tensor]:
-        """Quantize a speaker embedding and return its discrete codes."""
+        """Quantize speaker conditioning."""
 
         ...
 
@@ -44,22 +45,22 @@ class CodecModel(Protocol):
         mel: Tensor,
         embedding: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Encode a Mel chunk using an externally supplied speaker embedding."""
+        """Encode content using external speaker conditioning."""
 
         ...
 
 
 class PitchModel(Protocol):
-    """Mel-to-pitch TorchScript callable."""
+    """Exported Mel-to-pitch predictor."""
 
     def __call__(self, mel: Tensor) -> Tensor:
-        """Return predicted log-F0 and voicing values."""
+        """Predict log-F0 and voicing."""
 
         ...
 
 
 class PriorGeneratorModel(Protocol):
-    """DSPGAN prior generator with its exported infer method."""
+    """DSPGAN harmonic prior generator."""
 
     def infer(
         self,
@@ -67,26 +68,25 @@ class PriorGeneratorModel(Protocol):
         pitch: Tensor,
         voiced: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Return prior audio, harmonic noise, and upsampled voicing."""
+        """Generate prior audio, noise, and upsampled voicing."""
 
         ...
 
 
 class GeneratorModel(Protocol):
-    """DSPGAN waveform generator conditioned on prior Mels and voicing."""
+    """DSPGAN final waveform generator."""
 
     def __call__(self, mel: Tensor, voiced: Tensor) -> Tensor:
-        """Generate the final waveform batch."""
+        """Generate a waveform batch."""
 
         ...
 
 
 def load_torchscript(path: Path, device: torch.device) -> torch.jit.ScriptModule:
-    """Load a trusted TorchScript artifact directly onto the target device."""
+    """Load a locally trusted TorchScript model on the requested device."""
 
     if not path.is_file():
         raise FileNotFoundError(f"TorchScript model not found: {path}")
-
     model = torch.jit.load(str(path), map_location=device)
     model.eval()
 
@@ -94,21 +94,18 @@ def load_torchscript(path: Path, device: torch.device) -> torch.jit.ScriptModule
 
 
 def canonical_mel(mel: Tensor, channels: int) -> Tensor:
-    """Convert a single Mel spectrogram to (channels, frames) without flattening."""
+    """Convert a single spectrogram to (channels, frames) without flattening."""
 
     if mel.ndim == 3:
         if mel.shape[0] != 1:
-            raise ValueError("Only a single Mel spectrogram is supported.")
+            raise ValueError("Only one spectrogram is supported.")
         mel = mel.squeeze(0)
-
     if mel.ndim != 2:
-        raise ValueError(f"Expected a two-dimensional Mel spectrogram: {mel.shape}")
-
+        raise ValueError(f"Invalid Mel dimensions: {tuple(mel.shape)}")
     if mel.shape[0] != channels:
         if mel.shape[1] != channels:
-            raise ValueError(f"Expected {channels} Mel channels: {mel.shape}")
+            raise ValueError(f"Expected {channels} Mel channels.")
         mel = mel.transpose(0, 1)
-
     if mel.shape[1] == 0:
         raise ValueError("Mel spectrogram has no frames.")
 
@@ -116,14 +113,10 @@ def canonical_mel(mel: Tensor, channels: int) -> Tensor:
 
 
 class PriorMelTransform:
-    """Centered Torch STFT and Slaney filtering for DSPGAN prior audio.
-
-    The magnitude computation deliberately omits the epsilon used by other
-    legacy Torch spectral helpers.
-    """
+    """Centered STFT and Slaney filtering for DSPGAN prior audio."""
 
     def __init__(self, config: VocoderConfig, device: torch.device) -> None:
-        """Create float32 analysis tensors local to this vocoder instance."""
+        """Prepare device-local filter and window tensors."""
 
         self.config = config
         basis = librosa.filters.mel(
@@ -137,14 +130,14 @@ class PriorMelTransform:
             dtype=np.float32,
         )
         self.basis = torch.from_numpy(basis).to(device)
-        self.window = torch.hann_window(config.mel_win_length).to(device)
+        self.window = torch.hann_window(config.mel_win_length, device=device)
 
     def __call__(
         self,
         original_mel: Tensor,
         waveform: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Return normalized prior Mels and unnormalized residual amplitudes."""
+        """Return normalized prior Mels and residual amplitude features."""
 
         config = self.config
         spectrum = torch.stft(
@@ -161,45 +154,32 @@ class PriorMelTransform:
         )
         magnitude = torch.sqrt(torch.view_as_real(spectrum).pow(2).sum(dim=-1))
         prior_mel = torch.matmul(self.basis.to(dtype=waveform.dtype), magnitude)
-
-        frame_count = original_mel.shape[-1]
-        if prior_mel.shape[-1] < frame_count:
-            raise ValueError(
-                "Prior audio produces fewer Mel frames than the codec output: "
-                f"{prior_mel.shape[-1]} < {frame_count}."
-            )
-        prior_mel = prior_mel[:, :, :frame_count]
+        frames = original_mel.shape[-1]
+        if prior_mel.shape[-1] < frames:
+            raise ValueError("Prior audio contains fewer frames than codec output.")
+        prior_mel = prior_mel[:, :, :frames]
 
         original_db = (
-            (
-                torch.clamp(
-                    original_mel,
-                    -config.max_abs_value,
-                    config.max_abs_value,
-                )
-                + config.max_abs_value
-            )
-            * -config.min_db
-            / (2 * config.max_abs_value)
-        ) + config.min_db
-        original_amplitude = torch.pow(10.0, (original_db + config.ref_level_db) * 0.05)
-        residual = original_amplitude - prior_mel
-
-        minimum = float(np.exp(config.min_level_db / 20 * np.log(10)))
-        prior_db = 20 * torch.log10(torch.clamp(prior_mel, min=minimum))
-        prior_db = prior_db - config.ref_level_db
-        normalized = torch.clamp(
-            (2 * config.max_abs_value) * ((prior_db - config.min_db) / -config.min_db)
-            - config.max_abs_value,
-            -config.max_abs_value,
-            config.max_abs_value,
+            original_mel.clamp(-config.max_abs_value, config.max_abs_value)
+            + config.max_abs_value
+        ) * -config.min_db / (2 * config.max_abs_value) + config.min_db
+        original_amplitude = torch.pow(
+            10.0,
+            (original_db + config.ref_level_db) * 0.05,
         )
+        residual = original_amplitude - prior_mel
+        minimum = float(np.exp(config.min_level_db / 20 * np.log(10)))
+        prior_db = 20 * torch.log10(prior_mel.clamp_min(minimum)) - config.ref_level_db
+        normalized = (
+            2 * config.max_abs_value * ((prior_db - config.min_db) / -config.min_db)
+            - config.max_abs_value
+        ).clamp(-config.max_abs_value, config.max_abs_value)
 
         return normalized, residual
 
 
 class Vocoder:
-    """Lazy-loaded DSPGAN synthesis pipeline for decoded Mel spectrograms."""
+    """Lazily loaded DSPGAN synthesis pipeline."""
 
     def __init__(
         self,
@@ -207,7 +187,7 @@ class Vocoder:
         config: VocoderConfig,
         device: torch.device,
     ) -> None:
-        """Store model paths and analysis settings without loading artifacts."""
+        """Store independently loadable synthesis components."""
 
         self.paths = paths
         self.config = config
@@ -215,16 +195,13 @@ class Vocoder:
 
     @cached_property
     def pitch_model(self) -> PitchModel:
-        """Load the exported Mel-to-pitch model on first use."""
+        """Load the pitch predictor on first use."""
 
-        return cast(
-            PitchModel,
-            load_torchscript(self.paths.mel2f0, self.device),
-        )
+        return cast(PitchModel, load_torchscript(self.paths.mel2f0, self.device))
 
     @cached_property
     def prior_generator(self) -> PriorGeneratorModel:
-        """Load the exported harmonic prior generator on first use."""
+        """Load the harmonic prior generator on first use."""
 
         return cast(
             PriorGeneratorModel,
@@ -233,7 +210,7 @@ class Vocoder:
 
     @cached_property
     def generator(self) -> GeneratorModel:
-        """Load the exported final waveform generator on first use."""
+        """Load the final waveform generator on first use."""
 
         return cast(
             GeneratorModel,
@@ -242,54 +219,54 @@ class Vocoder:
 
     @cached_property
     def mel_transform(self) -> PriorMelTransform:
-        """Build the prior-audio spectral transform on first use."""
+        """Build device-local prior Mel analysis tensors."""
 
         return PriorMelTransform(self.config, self.device)
 
     @torch.inference_mode()
     def decode(self, mel: Tensor) -> Audio:
-        """Synthesize PCM16 audio using the original pitch and DSPGAN sequence."""
+        """Synthesize a single Mel block and safely saturate its PCM16 output."""
 
         mel = canonical_mel(mel, self.config.n_mel_channels)
         mel = mel.to(device=self.device, dtype=torch.float32)
-        conditions = (mel * self.config.mel2f0_scale).unsqueeze(0)
-
-        prediction = self.pitch_model(conditions)
+        prediction = self.pitch_model((mel * self.config.mel2f0_scale).unsqueeze(0))
         if prediction.ndim == 3 and prediction.shape[0] == 1:
             prediction = prediction.squeeze(0)
         if prediction.ndim != 2 or prediction.shape[1] != 2:
-            raise ValueError(
-                "The pitch model must return shape (1, frames, 2) "
-                f"or (frames, 2), got {tuple(prediction.shape)}."
-            )
+            raise ValueError("Pitch output must have shape (frames, 2).")
 
-        pitch_data = prediction.detach().cpu().numpy()
-        log_f0 = pitch_data[:, 0].copy()
-        log_f0[pitch_data[:, 1] < 0.5] = 0
+        values = prediction.detach().cpu().numpy()
+        if not np.isfinite(values).all():
+            raise ValueError("Pitch prediction contains non-finite values.")
 
-        voiced = np.zeros(log_f0.shape, dtype=np.float32)
-        voiced[log_f0 > 0] = 1
-        pitch_hz = np.where(log_f0 > 0, np.exp(log_f0), 0.0)
+        log_f0 = values[:, 0].copy()
+        log_f0[values[:, 1] < 0.5] = 0
+        voiced = (log_f0 > 0).astype(np.float32)
+        pitch_hz = np.zeros_like(log_f0)
+        active = log_f0 > 0
+        pitch_hz[active] = np.exp(log_f0[active])
+        if not np.isfinite(pitch_hz).all():
+            raise ValueError("Pitch prediction exceeds the finite Hz range.")
         pitch_hz = interpolate_pitch(pitch_hz)
 
-        pitch = torch.from_numpy(pitch_hz).to(
-            device=self.device,
-            dtype=torch.float32,
+        pitch = (
+            torch.from_numpy(pitch_hz)
+            .to(
+                device=self.device,
+                dtype=torch.float32,
+            )
+            .reshape(1, 1, -1)
         )
-        pitch = pitch.reshape(1, 1, -1)
         voiced_tensor = torch.from_numpy(voiced).to(self.device).reshape(1, 1, -1)
         batched_mel = mel.unsqueeze(0)
 
         mel_frames = batched_mel.shape[-1]
         pitch_frames = pitch.shape[-1]
         if pitch_frames == 0:
-            raise ValueError("The pitch model returned no frames.")
+            raise ValueError("Pitch prediction has no frames.")
         if pitch_frames > mel_frames:
             if pitch_frames - mel_frames >= 10:
-                raise ValueError(
-                    "Pitch exceeds Mel length by at least ten frames: "
-                    f"{pitch_frames} versus {mel_frames}."
-                )
+                raise ValueError("Pitch exceeds Mel length by at least ten frames.")
             pitch = pitch[:, :, :mel_frames]
             voiced_tensor = voiced_tensor[:, :, :mel_frames]
         elif pitch_frames < mel_frames:
@@ -300,46 +277,38 @@ class Vocoder:
             pitch,
             voiced_tensor,
         )
-        prior_mel, _ = self.mel_transform(
-            batched_mel,
-            prior_audio.squeeze(1),
-        )
+        prior_mel, _ = self.mel_transform(batched_mel, prior_audio.squeeze(1))
         waveform = self.generator(prior_mel, voiced_upsampled)
         samples = waveform.detach().cpu().float().numpy().reshape(-1)
-
         if not np.isfinite(samples).all():
             raise ValueError("The vocoder generated non-finite samples.")
 
-        # Direct PCM conversion preserves the legacy behavior at full scale.
-        pcm = (samples * self.config.max_wav_value).astype(np.int16)
+        pcm = np.clip(
+            samples * self.config.max_wav_value,
+            -32768,
+            32767,
+        ).astype(np.int16)
 
         return Audio(pcm, self.config.sampling_rate)
 
 
 class Models:
-    """Lazy model registry shared by the application's codec and vocoder paths."""
+    """Shared lazy model registry for one application configuration."""
 
     def __init__(self, config: Config) -> None:
-        """Store configuration and resolve the requested Torch device."""
+        """Store settings and resolve the Torch device."""
 
         self.config = config
         self.device = torch.device(config.device)
 
     @cached_property
     def codec(self) -> CodecModel:
-        """Load the exported codec without loading any vocoder components."""
+        """Load the scalable codec and select its configured quantizer prefix."""
 
-        return cast(
-            CodecModel,
-            load_torchscript(self.config.models.codec, self.device),
-        )
+        return cast(CodecModel, load_codec(self.config, self.device))
 
     @cached_property
     def vocoder(self) -> Vocoder:
-        """Create the independently lazy-loaded DSPGAN pipeline."""
+        """Create the independently lazy DSPGAN pipeline."""
 
-        return Vocoder(
-            self.config.models,
-            self.config.vocoder,
-            self.device,
-        )
+        return Vocoder(self.config.models, self.config.vocoder, self.device)

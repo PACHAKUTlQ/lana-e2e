@@ -9,111 +9,54 @@ from lana.config import Config, Feature
 from lana.runtime.pipeline import Lana
 
 
-def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add configuration and device options shared by inference subcommands."""
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add application configuration and optional device selection."""
 
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("config.json"),
-        help="Application configuration file.",
-    )
-    parser.add_argument(
-        "--device",
-        help="Override the configured Torch device.",
-    )
+    parser.add_argument("--config", type=Path, default=Path("config.json"))
+    parser.add_argument("--device", help="Override the configured Torch device.")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build commands for training, comparison, and inference operations."""
+    """Build the unified training, inference, extraction, and streaming CLI."""
 
     parser = argparse.ArgumentParser(
         prog="lana",
-        description="Mel codec training, SingleCodec inference, and DSPGAN synthesis.",
+        description="Scalable Mel codec training and streaming synthesis.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    train = commands.add_parser(
-        "train",
-        help="Train and export a new FSQ Mel codec.",
-    )
-    train.add_argument(
-        "--config",
-        type=Path,
-        default=Path("training.json"),
-        help="Training configuration file.",
-    )
-    train.add_argument(
-        "--resume",
-        type=Path,
-        help="Resume a trusted Lightning training checkpoint.",
-    )
+    train = commands.add_parser("train", help="Train and export a scalable codec.")
+    train.add_argument("--config", type=Path, default=Path("config.json"))
+    train.add_argument("--resume", type=Path)
 
-    comparison = commands.add_parser(
-        "compare-mel",
-        help="Plot aligned Mel-power spectrograms of two audio files.",
-    )
-    comparison.add_argument("original", type=Path)
-    comparison.add_argument("generated", type=Path)
-    comparison.add_argument("output", type=Path)
-    comparison.add_argument(
-        "--config",
-        type=Path,
-        default=Path("config.json"),
-        help="Configuration supplying the audio frontend.",
-    )
-    comparison.add_argument(
-        "--max-shift-seconds",
-        type=float,
-        default=2.0,
-        help="Maximum alignment offset in seconds.",
-    )
-
-    encode = commands.add_parser(
-        "encode", help="Encode audio into content and speaker codes."
-    )
-    _add_common_arguments(encode)
+    encode = commands.add_parser("encode", help="Encode an utterance into NPY codes.")
+    add_common_arguments(encode)
     encode.add_argument("input", type=Path)
     encode.add_argument("content", type=Path)
     encode.add_argument("speaker", type=Path)
     encode.add_argument("--seed", type=int)
     encode.add_argument("--prompt-length", type=int)
 
-    decode = commands.add_parser(
-        "decode", help="Decode content and speaker codes into audio."
-    )
-    _add_common_arguments(decode)
+    decode = commands.add_parser("decode", help="Decode NPY codes into audio.")
+    add_common_arguments(decode)
     decode.add_argument("content", type=Path)
     decode.add_argument("speaker", type=Path)
     decode.add_argument("output", type=Path)
 
-    decode_mel = commands.add_parser(
-        "decode-mel", help="Synthesize a normalized Mel NPY file."
-    )
-    _add_common_arguments(decode_mel)
+    decode_mel = commands.add_parser("decode-mel", help="Synthesize a Mel NPY file.")
+    add_common_arguments(decode_mel)
     decode_mel.add_argument("input", type=Path)
     decode_mel.add_argument("output", type=Path)
 
-    infer = commands.add_parser("infer", help="Run chunked audio reconstruction.")
-    _add_common_arguments(infer)
+    infer = commands.add_parser("infer", help="Run offline chunked reconstruction.")
+    add_common_arguments(infer)
     infer.add_argument("input", type=Path)
     infer.add_argument("output", type=Path)
-    infer.add_argument("--chunk-size", type=int)
-    infer.add_argument("--prompt-length", type=int)
-    infer.add_argument("--new-emb-weight", type=float)
-    infer.add_argument("--mel-cache-length", type=int)
-    infer.add_argument("--minimum-chunk-frames", type=int)
     infer.add_argument("--quiet", action="store_true")
 
-    extract = commands.add_parser(
-        "extract", help="Extract acoustic features into NPY files."
-    )
-    _add_common_arguments(extract)
-    extract.add_argument(
-        "input",
-        type=Path,
-        help="A WAV file, a directory of WAV files, or a text manifest.",
-    )
+    extract = commands.add_parser("extract", help="Extract acoustic feature files.")
+    add_common_arguments(extract)
+    extract.add_argument("input", type=Path)
     extract.add_argument("output", type=Path)
     extract.add_argument(
         "--features",
@@ -126,50 +69,35 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--incremental", action="store_true")
     extract.add_argument("--quiet", action="store_true")
 
-    convert = commands.add_parser(
-        "linear-to-mel",
-        help="Convert a frontend-scaled linear NPY file into Mel features.",
-    )
-    _add_common_arguments(convert)
+    convert = commands.add_parser("linear-to-mel", help="Convert linear features.")
+    add_common_arguments(convert)
     convert.add_argument("input", type=Path)
     convert.add_argument("output", type=Path)
 
-    stream_send = commands.add_parser(
-        "stream-send",
-        help="Send an audio file as a paced stream of encoded chunks.",
-    )
-    stream_send.add_argument("input", type=Path)
-    stream_send.add_argument("--config", type=Path, default=Path("config.json"))
-    stream_send.add_argument("--host", default="127.0.0.1")
-    stream_send.add_argument("--port", type=int, default=8765)
-    stream_send.add_argument(
-        "--no-realtime",
-        action="store_true",
-        help="Send as fast as encoding and network backpressure permit.",
-    )
+    send = commands.add_parser("stream-send", help="Stream an encoded audio file.")
+    add_common_arguments(send)
+    send.add_argument("input", type=Path)
+    send.add_argument("--host", default="127.0.0.1")
+    send.add_argument("--port", type=int, default=8765)
+    send.add_argument("--no-realtime", action="store_true")
 
-    stream_receive = commands.add_parser(
+    receive = commands.add_parser(
         "stream-receive",
-        help="Receive one encoded stream and progressively write a WAV.",
+        help="Receive one stream into a WAV file.",
     )
-    stream_receive.add_argument("output", type=Path)
-    stream_receive.add_argument(
-        "--config",
-        type=Path,
-        default=Path("config.json"),
-    )
-    stream_receive.add_argument("--host", default="127.0.0.1")
-    stream_receive.add_argument("--port", type=int, default=8765)
+    add_common_arguments(receive)
+    receive.add_argument("output", type=Path)
+    receive.add_argument("--host", default="127.0.0.1")
+    receive.add_argument("--port", type=int, default=8765)
 
     return parser
 
 
-def _load_config(arguments: argparse.Namespace) -> Config:
-    """Load JSON and revalidate explicitly supplied inference overrides."""
+def load_config(arguments: argparse.Namespace) -> Config:
+    """Apply explicit CLI overrides through configuration validation."""
 
     config = Config.from_file(arguments.config)
     values = config.model_dump(mode="python")
-
     if arguments.device is not None:
         values["device"] = arguments.device
 
@@ -181,25 +109,11 @@ def _load_config(arguments: argparse.Namespace) -> Config:
                 encoding[name] = value
         values["encoding"] = encoding
 
-    if arguments.command == "infer":
-        inference = config.inference.model_dump(mode="python")
-        for name in (
-            "chunk_size",
-            "prompt_length",
-            "new_emb_weight",
-            "mel_cache_length",
-            "minimum_chunk_frames",
-        ):
-            value = getattr(arguments, name)
-            if value is not None:
-                inference[name] = value
-        values["inference"] = inference
-
     return Config.model_validate(values)
 
 
-def _execute(arguments: argparse.Namespace) -> None:
-    """Dispatch commands without loading training or plotting code unnecessarily."""
+def execute(arguments: argparse.Namespace) -> None:
+    """Dispatch commands while keeping training imports outside inference paths."""
 
     if arguments.command == "train":
         from lana.training.runner import train
@@ -208,25 +122,12 @@ def _execute(arguments: argparse.Namespace) -> None:
 
         return
 
-    if arguments.command == "compare-mel":
-        from lana.analysis.mel_comparison import plot_mel_comparison
-
-        destination = plot_mel_comparison(
-            arguments.original,
-            arguments.generated,
-            arguments.output,
-            config_path=arguments.config,
-            max_shift_seconds=arguments.max_shift_seconds,
-        )
-        print(destination)
-
-        return
-
+    config = load_config(arguments)
     if arguments.command in {"stream-send", "stream-receive"}:
         from lana.streaming.network import receive_file, send_file
 
-        config = Config.from_file(arguments.config)
-
+        if not 1 <= arguments.port <= 65535:
+            raise ValueError("Port must be between 1 and 65535.")
         if arguments.command == "stream-send":
             send_file(
                 arguments.input,
@@ -245,12 +146,13 @@ def _execute(arguments: argparse.Namespace) -> None:
 
         return
 
-    application = Lana(_load_config(arguments))
-
+    application = Lana(config)
     match arguments.command:
         case "encode":
-            tokens = application.encode(arguments.input)
-            tokens.save(arguments.content, arguments.speaker)
+            application.encode(arguments.input).save(
+                arguments.content,
+                arguments.speaker,
+            )
         case "decode":
             tokens = Tokens.load(arguments.content, arguments.speaker)
             application.decode(tokens).save(arguments.output)
@@ -273,18 +175,19 @@ def _execute(arguments: argparse.Namespace) -> None:
             )
         case "linear-to-mel":
             linear = np.asarray(load_array(arguments.input), dtype=np.float32)
-            mel = application.convert_linear_to_mel(linear)
-            save_array(arguments.output, mel)
+            save_array(arguments.output, application.convert_linear_to_mel(linear))
         case _:
             raise ValueError(f"Unknown command: {arguments.command}")
 
 
-def _format_error(error: BaseException) -> str:
-    """Format explicit exception causes without discarding the original failure."""
+def format_error(error: BaseException) -> str:
+    """Include explicit exception causes without losing the originating failure."""
 
     messages = [str(error)]
+    seen = {id(error)}
     cause = error.__cause__
-    while cause is not None:
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
         messages.append(str(cause))
         cause = cause.__cause__
 
@@ -292,15 +195,13 @@ def _format_error(error: BaseException) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the CLI and return a process exit status."""
+    """Run the application command and return its process exit status."""
 
-    parser = build_parser()
-    arguments = parser.parse_args(argv)
-
+    arguments = build_parser().parse_args(argv)
     try:
-        _execute(arguments)
+        execute(arguments)
     except (OSError, ValueError, RuntimeError, FloatingPointError) as error:
-        print(f"lana: {_format_error(error)}", file=sys.stderr)
+        print(f"lana: {format_error(error)}", file=sys.stderr)
 
         return 1
     except KeyboardInterrupt:
