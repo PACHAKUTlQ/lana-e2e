@@ -1,4 +1,6 @@
 import math
+from collections.abc import Iterator
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -101,6 +103,24 @@ class ResidualScalarStage(nn.Module):
         return self.synthesis(self.quantizer.decode_indices(indices)).float()
 
 
+class ResidualStageList(nn.ModuleList):
+    """Register residual stages with a precisely typed Python iterator.
+
+    TorchScript expands this collection as a ModuleList. The iterator
+    annotation supplies the element type to Python static type checkers.
+    """
+
+    def __init__(self, stages: list[ResidualScalarStage]) -> None:
+        """Register the ordered residual stages under numeric module names."""
+
+        super().__init__(stages)
+
+    def __iter__(self) -> Iterator[ResidualScalarStage]:
+        """Iterate over the registered residual stages."""
+
+        return cast(Iterator[ResidualScalarStage], super().__iter__())
+
+
 class ResidualScalarQuantizer(nn.Module):
     """Represent a latent vector with a truncatable prefix of residual stages."""
 
@@ -115,7 +135,7 @@ class ResidualScalarQuantizer(nn.Module):
         super().__init__()
         self.channels = channels
         self.num_quantizers = num_quantizers
-        self.stages = nn.ModuleList(
+        self.stages = ResidualStageList(
             [ResidualScalarStage(channels, levels) for _ in range(num_quantizers)]
         )
 
@@ -158,7 +178,6 @@ class ResidualScalarQuantizer(nn.Module):
         )
         for index, stage in enumerate(self.stages):
             if index < layers:
-                assert isinstance(stage, ResidualScalarStage)
                 result = result + stage.decode(codes[:, :, index])
 
         return result
