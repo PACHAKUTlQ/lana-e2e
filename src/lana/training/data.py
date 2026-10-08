@@ -1,4 +1,3 @@
-import csv
 import hashlib
 import json
 import random
@@ -11,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from lana.artifacts import FeatureArray, load_array, save_array
-from lana.config import Config, TrainingConfig
+from lana.config import Config, TrainingConfig, TrainingDataConfig
 from lana.streaming.audio import iter_pcm
 from lana.streaming.frontend import StreamingMelFrontend
 
@@ -20,44 +19,100 @@ type TrainingBatch = dict[str, torch.Tensor]
 _CACHE_VERSION = 2
 
 
-def read_manifest(directory: Path) -> list[Path]:
-    """Read LJSpeech identifiers and verify their corresponding audio files."""
+def discover_training_audio(settings: TrainingDataConfig) -> list[Path]:
+    """Recursively discover audio without requiring dataset-specific metadata.
 
-    metadata = directory / "metadata.csv"
-    paths: list[Path] = []
-    seen: set[str] = set()
+    Matching suffixes are case-insensitive. Results are sorted by paths
+    relative to the configured root so discovery order is reproducible across
+    machines containing the same directory layout.
+    """
 
-    with metadata.open(encoding="utf-8-sig", newline="") as stream:
-        reader = csv.reader(stream, delimiter="|", quoting=csv.QUOTE_NONE)
-        for line_number, row in enumerate(reader, start=1):
-            if not row:
-                continue
-            if len(row) != 3:
-                raise ValueError(
-                    f"{metadata}:{line_number}: expected three metadata fields."
-                )
-            identifier = row[0].strip()
-            if (
-                not identifier
-                or identifier in {".", ".."}
-                or "/" in identifier
-                or "\\" in identifier
-            ):
-                raise ValueError(f"{metadata}:{line_number}: invalid audio identifier.")
-            if identifier in seen:
-                raise ValueError(f"Duplicate audio identifier: {identifier}")
+    directory = settings.directory.expanduser().resolve()
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Training audio directory not found: {directory}")
 
-            path = directory / "wavs" / f"{identifier}.wav"
-            if not path.is_file():
-                raise FileNotFoundError(f"Audio file not found: {path}")
-
-            seen.add(identifier)
-            paths.append(path)
-
+    extensions = set(settings.audio_extensions)
+    paths = sorted(
+        (
+            path
+            for path in directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in extensions
+        ),
+        key=lambda path: path.relative_to(directory).as_posix(),
+    )
     if len(paths) < 2:
-        raise ValueError("Training requires at least two utterances.")
+        raise ValueError(
+            f"Training requires at least two audio files in {directory}; "
+            f"found {len(paths)} matching {settings.audio_extensions}."
+        )
 
     return paths
+
+
+def split_training_audio(
+    paths: list[Path],
+    settings: TrainingDataConfig,
+    *,
+    seed: int,
+) -> tuple[list[Path], list[Path]]:
+    """Partition audio deterministically, optionally keeping directory groups intact.
+
+    Without grouping, validation_fraction applies to files. With grouping, it
+    applies to distinct values of the selected relative directory component.
+    Both modes retain at least one training and one validation unit.
+
+    Grouped output preserves discovery order. A missing directory component
+    raises an error instead of silently assigning an incorrect group.
+    """
+
+    component = settings.validation_group_component
+    randomizer = random.Random(seed)
+
+    if component is None:
+        shuffled = paths.copy()
+        randomizer.shuffle(shuffled)
+        validation_count = min(
+            len(shuffled) - 1,
+            max(1, round(len(shuffled) * settings.validation_fraction)),
+        )
+
+        return shuffled[validation_count:], shuffled[:validation_count]
+
+    directory = settings.directory.expanduser().resolve()
+    path_groups: list[tuple[Path, str]] = []
+    for path in paths:
+        relative = path.relative_to(directory)
+        components = relative.parent.parts
+        if component >= len(components):
+            raise ValueError(
+                f"Audio path {relative} has no relative directory component "
+                f"{component} for validation grouping."
+            )
+        path_groups.append((path, components[component]))
+
+    groups = sorted({group for _, group in path_groups})
+    if len(groups) < 2:
+        raise ValueError(
+            "Grouped validation requires at least two distinct groups; "
+            f"found {len(groups)} at directory component {component}."
+        )
+
+    randomizer.shuffle(groups)
+    validation_count = min(
+        len(groups) - 1,
+        max(1, round(len(groups) * settings.validation_fraction)),
+    )
+    validation_groups = set(groups[:validation_count])
+    training_paths: list[Path] = []
+    validation_paths: list[Path] = []
+
+    for path, group in path_groups:
+        if group in validation_groups:
+            validation_paths.append(path)
+        else:
+            training_paths.append(path)
+
+    return training_paths, validation_paths
 
 
 class MelSequenceDataset(Dataset[TrainingBatch]):
@@ -179,24 +234,24 @@ class MelDataModule(L.LightningDataModule):
         self.validation_dataset: MelSequenceDataset | None = None
 
     def setup(self, stage: str | None = None) -> None:
-        """Create identical partitions on all ranks from a sorted manifest."""
+        """Discover audio and create identical file or group partitions on all ranks."""
 
         if self.training_dataset is not None:
             return
 
-        paths = read_manifest(self.settings.data.directory)
-        random.Random(self.settings.seed).shuffle(paths)
-        validation_count = min(
-            len(paths) - 1,
-            max(1, round(len(paths) * self.settings.data.validation_fraction)),
+        paths = discover_training_audio(self.settings.data)
+        training_paths, validation_paths = split_training_audio(
+            paths,
+            self.settings.data,
+            seed=self.settings.seed,
         )
         self.validation_dataset = MelSequenceDataset(
-            paths[:validation_count],
+            validation_paths,
             self.config,
             training=False,
         )
         self.training_dataset = MelSequenceDataset(
-            paths[validation_count:],
+            training_paths,
             self.config,
             training=True,
         )

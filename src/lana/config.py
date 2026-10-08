@@ -3,7 +3,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Normalization(StrEnum):
@@ -226,14 +226,56 @@ class CodecArchitecture(FrozenConfig):
 
 
 class TrainingDataConfig(FrozenConfig):
-    """LJSpeech paths and fixed-length sequences of consecutive stream blocks."""
+    """Recursive audio discovery and fixed-length consecutive stream blocks.
+
+    Audio extensions are matched case-insensitively. Dataset metadata and
+    transcripts are not required.
+
+    validation_group_component selects a zero-based directory component
+    relative to directory. Equal component values remain in the same split,
+    even when they occur under different parent directories. When configured,
+    validation_fraction applies to groups rather than individual audio files.
+    A null component retains an utterance-level random split.
+    """
 
     directory: Path = Path("dataset/LJSpeech-1.1")
     cache_directory: Path = Path("outputs/cache/streaming-mels")
+    audio_extensions: tuple[str, ...] = Field(
+        default=(
+            ".wav",
+            ".flac",
+            ".mp3",
+            ".ogg",
+            ".opus",
+            ".m4a",
+            ".aac",
+            ".aif",
+            ".aiff",
+            ".wma",
+        ),
+        min_length=1,
+    )
     validation_fraction: float = Field(default=0.02, gt=0, lt=1)
+    validation_group_component: int | None = Field(default=None, ge=0)
     sequence_chunks: int = Field(default=8, ge=1)
     batch_size: int = Field(default=8, ge=1)
     workers: int = Field(default=4, ge=0)
+
+    @field_validator("audio_extensions")
+    @classmethod
+    def validate_audio_extensions(
+        cls,
+        extensions: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Normalize suffixes and reject values that are not simple extensions."""
+
+        for extension in extensions:
+            if not extension.startswith(".") or not extension[1:].isalnum():
+                raise ValueError(
+                    "audio_extensions must contain suffixes such as .wav or .flac."
+                )
+
+        return tuple(dict.fromkeys(extension.lower() for extension in extensions))
 
 
 class OptimizationConfig(FrozenConfig):
